@@ -9,9 +9,14 @@ function getWordCount(text) {
   return text.trim() ? text.trim().split(/\s+/).length : 0;
 }
 
+function getFileExt(name) {
+  return name.split(".").pop().toLowerCase();
+}
+
 const DEMO_DOC = {
   id: "demo1",
   name: "Product Roadmap Q3",
+  ext: "txt",
   content: `Product Roadmap - Q3 2026
 
 THEME: AI-first user experience
@@ -46,6 +51,53 @@ Operations: $50,000`,
   updatedAt: new Date(),
 };
 
+async function loadPdfJs() {
+  if (window.pdfjsLib) return window.pdfjsLib;
+  await new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  return window.pdfjsLib;
+}
+
+async function loadMammoth() {
+  if (window.mammoth) return window.mammoth;
+  await new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js";
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+  return window.mammoth;
+}
+
+async function extractTextFromPDF(file) {
+  const pdfjsLib = await loadPdfJs();
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  let fullText = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = content.items.map((item) => item.str).join(" ");
+    fullText += `[Page ${i}]\n${pageText}\n\n`;
+  }
+  return fullText.trim();
+}
+
+async function extractTextFromDocx(file) {
+  const mammoth = await loadMammoth();
+  const arrayBuffer = await file.arrayBuffer();
+  const result = await mammoth.extractRawText({ arrayBuffer });
+  return result.value.trim();
+}
+
 export default function App() {
   const [docs, setDocs] = useState([DEMO_DOC]);
   const [activeDocId, setActiveDocId] = useState("demo1");
@@ -53,11 +105,12 @@ export default function App() {
     {
       id: "w1",
       role: "ai",
-      text: "Hey! I'm your document assistant. Upload or select a document, and ask me anything about it. I always use the latest version of your edited content.",
+      text: "Hey! I'm your document assistant powered by Google Gemini. Upload any document — PDF, Word, or text — and ask me anything about it!",
     },
   ]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [saved, setSaved] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const fileInputRef = useRef(null);
@@ -70,23 +123,35 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  function handleFileUpload(e) {
+  async function handleFileUpload(e) {
     const files = Array.from(e.target.files || []);
-    files.forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        const content = ev.target.result;
+    setUploading(true);
+    for (const file of files) {
+      const ext = getFileExt(file.name);
+      const name = file.name.replace(/\.[^.]+$/, "");
+      let content = "";
+      try {
+        if (ext === "pdf") {
+          content = await extractTextFromPDF(file);
+        } else if (ext === "docx" || ext === "doc") {
+          content = await extractTextFromDocx(file);
+        } else {
+          content = await file.text();
+        }
         const newDoc = {
           id: generateId(),
-          name: file.name.replace(/\.[^.]+$/, ""),
-          content: typeof content === "string" ? content : `[Binary file: ${file.name}]`,
+          name,
+          ext,
+          content: content || "[Could not extract text from this file]",
           updatedAt: new Date(),
         };
         setDocs((prev) => [...prev, newDoc]);
         setActiveDocId(newDoc.id);
-      };
-      reader.readAsText(file);
-    });
+      } catch (err) {
+        alert(`Failed to read ${file.name}: ${err.message}`);
+      }
+    }
+    setUploading(false);
     e.target.value = "";
   }
 
@@ -117,6 +182,7 @@ export default function App() {
     const doc = {
       id: generateId(),
       name: "Untitled Document",
+      ext: "txt",
       content: "",
       updatedAt: new Date(),
     };
@@ -126,74 +192,51 @@ export default function App() {
 
   async function sendMessage() {
     if (!input.trim() || loading) return;
-
-    // Check for API key
-    const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
+    const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
     if (!apiKey) {
       setMessages((prev) => [
         ...prev,
         {
           id: generateId(),
           role: "ai",
-          text: "⚠️ No API key found. Please add your VITE_ANTHROPIC_API_KEY to the .env file (local) or Vercel environment variables (deployed).",
+          text: "⚠️ No API key found. Please add VITE_GEMINI_API_KEY to Vercel's Environment Variables and redeploy.",
         },
       ]);
       return;
     }
-
     const userText = input.trim();
     setInput("");
     setMessages((prev) => [...prev, { id: generateId(), role: "user", text: userText }]);
     setLoading(true);
-
     const docsContext = docs.length
       ? docs.map((d) => `--- Document: "${d.name}" ---\n${d.content}`).join("\n\n")
       : "No documents available.";
-
-    const systemPrompt = `You are a helpful AI assistant for a document knowledge base app. The user has uploaded and may have edited the following documents. Always answer based ONLY on the current document content below — it reflects the latest edits.
-
-${docsContext}
-
-Be concise, helpful, and reference specific parts of the documents when relevant. If the answer isn't in the documents, say so honestly.`;
-
-    const conversationHistory = messages
+    const systemInstruction = `You are a helpful AI assistant for a document knowledge base app. Always answer based ONLY on the current document content below.\n\n${docsContext}\n\nBe concise and helpful. If the answer isn't in the documents, say so.`;
+    const history = messages
       .filter((m) => m.id !== "w1")
-      .map((m) => ({ role: m.role === "ai" ? "assistant" : "user", content: m.text }));
-
+      .map((m) => ({
+        role: m.role === "user" ? "user" : "model",
+        parts: [{ text: m.text }],
+      }));
     try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
-          system: systemPrompt,
-          messages: [...conversationHistory, { role: "user", content: userText }],
-        }),
-      });
-
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemInstruction }] },
+            contents: [...history, { role: "user", parts: [{ text: userText }] }],
+            generationConfig: { maxOutputTokens: 1000, temperature: 0.7 },
+          }),
+        }
+      );
       const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error?.message || "API error");
-      }
-
-      const reply = data.content?.[0]?.text || "Sorry, I couldn't generate a response.";
+      if (!response.ok) throw new Error(data.error?.message || "Gemini API error");
+      const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't generate a response.";
       setMessages((prev) => [...prev, { id: generateId(), role: "ai", text: reply }]);
     } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: generateId(),
-          role: "ai",
-          text: `⚠️ Error: ${err.message}. Check your API key and try again.`,
-        },
-      ]);
+      setMessages((prev) => [...prev, { id: generateId(), role: "ai", text: `⚠️ Error: ${err.message}` }]);
     }
     setLoading(false);
   }
@@ -207,128 +250,71 @@ Be concise, helpful, and reference specific parts of the documents when relevant
 
   return (
     <div className="app">
-      {/* HEADER */}
       <header className="header">
-        <button className="menu-btn" onClick={() => setSidebarOpen((v) => !v)} title="Toggle sidebar">
+        <button className="menu-btn" onClick={() => setSidebarOpen((v) => !v)}>
           <span /><span /><span />
         </button>
         <div className="logo-dot" />
         <div className="logo">DocMind</div>
-        <div className="header-sub">AI-powered document knowledge base</div>
+        <div className="header-sub">powered by Google Gemini · free</div>
       </header>
-
       <div className="main-layout">
-        {/* SIDEBAR */}
         <aside className={`sidebar ${sidebarOpen ? "open" : "closed"}`}>
           <div className="sidebar-header">
             <span>Documents</span>
-            <button className="upload-btn" onClick={() => fileInputRef.current?.click()}>
-              ＋ Upload
+            <button className="upload-btn" onClick={() => fileInputRef.current?.click()} disabled={uploading}>
+              {uploading ? "Reading..." : "＋ Upload"}
             </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept=".txt,.md,.csv,.json,.js,.ts,.py,.html,.css,.xml,.yaml,.yml"
-              style={{ display: "none" }}
-              onChange={handleFileUpload}
-            />
+            <input ref={fileInputRef} type="file" multiple accept=".txt,.md,.csv,.json,.js,.ts,.py,.html,.css,.xml,.yaml,.yml,.pdf,.doc,.docx" style={{ display: "none" }} onChange={handleFileUpload} />
           </div>
-
           <div className="doc-list">
             {docs.length === 0 ? (
-              <div className="empty-docs">
-                <span>📄</span>
-                No documents yet. Upload a file or create one.
-              </div>
+              <div className="empty-docs"><span>📄</span>No documents yet.</div>
             ) : (
               docs.map((doc) => (
-                <div
-                  key={doc.id}
-                  className={`doc-item ${doc.id === activeDocId ? "active" : ""}`}
-                  onClick={() => setActiveDocId(doc.id)}
-                >
+                <div key={doc.id} className={`doc-item ${doc.id === activeDocId ? "active" : ""}`} onClick={() => setActiveDocId(doc.id)}>
                   <div className="doc-name">{doc.name}</div>
                   <div className="doc-meta">{getWordCount(doc.content).toLocaleString()} words</div>
                   <div className="doc-actions">
-                    <span className="doc-tag">txt</span>
-                    <button
-                      className="delete-btn"
-                      onClick={(e) => { e.stopPropagation(); deleteDoc(doc.id); }}
-                    >
-                      remove
-                    </button>
+                    <span className={`doc-tag ${doc.ext === "pdf" ? "tag-pdf" : doc.ext === "docx" || doc.ext === "doc" ? "tag-word" : ""}`}>{doc.ext || "txt"}</span>
+                    <button className="delete-btn" onClick={(e) => { e.stopPropagation(); deleteDoc(doc.id); }}>remove</button>
                   </div>
                 </div>
               ))
             )}
           </div>
-
           <div className="sidebar-footer">
-            <button className="new-doc-btn" onClick={newDoc}>
-              + New Document
-            </button>
+            <button className="new-doc-btn" onClick={newDoc}>+ New Document</button>
+            <div className="supported-formats">PDF · DOCX · TXT · MD · CSV · JSON</div>
           </div>
         </aside>
-
-        {/* EDITOR */}
         <main className="editor-panel">
-          {activeDoc ? (
+          {uploading ? (
+            <div className="editor-body"><div className="no-doc-placeholder"><div className="upload-spinner">⏳</div><h2>Reading document...</h2><p>Extracting text, please wait.</p></div></div>
+          ) : activeDoc ? (
             <>
               <div className="editor-toolbar">
-                <input
-                  className="doc-title-input"
-                  value={activeDoc.name}
-                  onChange={(e) => handleTitleChange(e.target.value)}
-                  placeholder="Document title..."
-                />
-                <div className={`save-indicator ${saved ? "saved" : "editing"}`}>
-                  <div className="save-dot" />
-                  {saved ? "Saved" : "Editing..."}
-                </div>
+                <input className="doc-title-input" value={activeDoc.name} onChange={(e) => handleTitleChange(e.target.value)} placeholder="Document title..." />
+                <div className={`save-indicator ${saved ? "saved" : "editing"}`}><div className="save-dot" />{saved ? "Saved" : "Editing..."}</div>
               </div>
               <div className="editor-body">
-                <textarea
-                  className="doc-content-area"
-                  value={activeDoc.content}
-                  onChange={(e) => handleContentChange(e.target.value)}
-                  placeholder="Start typing or paste your document content here. Edit freely — the AI will always use the latest version when you ask questions."
-                  spellCheck={false}
-                />
+                <textarea className="doc-content-area" value={activeDoc.content} onChange={(e) => handleContentChange(e.target.value)} placeholder="Start typing or paste content here." spellCheck={false} />
               </div>
             </>
           ) : (
-            <div className="editor-body">
-              <div className="no-doc-placeholder">
-                <h2>No document selected</h2>
-                <p>Upload a file from the sidebar, or create a new document to get started.</p>
-                <div className="drop-zone-hint" onClick={() => fileInputRef.current?.click()}>
-                  <span>📂</span>
-                  <p>Click to upload a file</p>
-                  <small>.txt · .md · .csv · .json · .py · .js and more</small>
-                </div>
-              </div>
-            </div>
+            <div className="editor-body"><div className="no-doc-placeholder"><h2>No document selected</h2><p>Upload a file or create a new document.</p><div className="drop-zone-hint" onClick={() => fileInputRef.current?.click()}><span>📂</span><p>Click to upload</p><small>PDF · DOCX · TXT · MD · CSV · JSON</small></div></div></div>
           )}
         </main>
-
-        {/* CHAT */}
         <aside className="chat-panel">
           <div className="chat-header">
             <span>AI Assistant</span>
             <div className="chat-header-right">
               {activeDoc && <div className="ctx-pill">📄 {activeDoc.name}</div>}
-              <div className="chat-status">
-                <div className="status-dot" /> live
-              </div>
+              <div className="chat-status"><div className="status-dot" /> live</div>
             </div>
           </div>
-
           {docs.length === 0 ? (
-            <div className="no-docs-chat">
-              <span>🤖</span>
-              <p>Upload at least one document to start asking questions.</p>
-            </div>
+            <div className="no-docs-chat"><span>🤖</span><p>Upload a document to start.</p></div>
           ) : (
             <>
               <div className="chat-messages">
@@ -338,49 +324,18 @@ Be concise, helpful, and reference specific parts of the documents when relevant
                     <div className="bubble">{msg.text}</div>
                   </div>
                 ))}
-                {loading && (
-                  <div className="msg ai">
-                    <div className="msg-label">docmind</div>
-                    <div className="bubble">
-                      <div className="typing">
-                        <span /><span /><span />
-                      </div>
-                    </div>
-                  </div>
-                )}
+                {loading && <div className="msg ai"><div className="msg-label">docmind</div><div className="bubble"><div className="typing"><span /><span /><span /></div></div></div>}
                 <div ref={messagesEndRef} />
               </div>
-
               <div className="chat-input-area">
-                <textarea
-                  className="chat-input"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder="Ask anything about your documents…"
-                  rows={1}
-                />
-                <button
-                  className="send-btn"
-                  onClick={sendMessage}
-                  disabled={!input.trim() || loading}
-                  title="Send"
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <line x1="22" y1="2" x2="11" y2="13" />
-                    <polygon points="22 2 15 22 11 13 2 9 22 2" />
-                  </svg>
+                <textarea className="chat-input" value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={handleKeyDown} placeholder="Ask anything about your documents…" rows={1} />
+                <button className="send-btn" onClick={sendMessage} disabled={!input.trim() || loading}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
                 </button>
               </div>
-
               <div className="chat-footer">
                 <span className="doc-count">{docs.length} doc{docs.length !== 1 ? "s" : ""} in context</span>
-                <button
-                  className="clear-btn"
-                  onClick={() => setMessages([{ id: generateId(), role: "ai", text: "Chat cleared. Ask me anything about your documents!" }])}
-                >
-                  clear chat
-                </button>
+                <button className="clear-btn" onClick={() => setMessages([{ id: generateId(), role: "ai", text: "Chat cleared!" }])}>clear chat</button>
               </div>
             </>
           )}
